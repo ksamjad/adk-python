@@ -70,13 +70,12 @@ class RestApiTool(BaseTool):
   * Generates request params and body
   * Attaches auth credentials to API call.
 
-  Example:
-  ```
+  Example::
+
     # Each API operation in the spec will be turned into its own tool
     # Name of the tool is the operationId of that operation, in snake case
     operations = OperationGenerator().parse(openapi_spec_dict)
     tool = [RestApiTool.from_parsed_operation(o) for o in operations]
-  ```
   """
 
   def __init__(
@@ -92,13 +91,12 @@ class RestApiTool(BaseTool):
     """Initializes the RestApiTool with the given parameters.
 
     To generate RestApiTool from OpenAPI Specs, use OperationGenerator.
-    Example:
-    ```
+    Example::
+
       # Each API operation in the spec will be turned into its own tool
       # Name of the tool is the operationId of that operation, in snake case
       operations = OperationGenerator().parse(openapi_spec_dict)
       tool = [RestApiTool.from_parsed_operation(o) for o in operations]
-    ```
 
     Hint: Use google.adk.tools.openapi_tool.auth.auth_helpers to construct
     auth_scheme and auth_credential.
@@ -136,6 +134,7 @@ class RestApiTool(BaseTool):
 
     # Private properties
     self.credential_exchanger = AutoAuthCredentialExchanger()
+    self._default_headers: Dict[str, str] = {}
     if should_parse_operation:
       self._operation_parser = OperationParser(self.operation)
 
@@ -218,6 +217,10 @@ class RestApiTool(BaseTool):
       auth_credential = AuthCredential.model_validate_json(auth_credential)
     self.auth_credential = auth_credential
 
+  def set_default_headers(self, headers: Dict[str, str]):
+    """Sets default headers that are merged into every request."""
+    self._default_headers = headers
+
   def _prepare_auth_request_params(
       self,
       auth_scheme: AuthScheme,
@@ -247,6 +250,7 @@ class RestApiTool(BaseTool):
     Example:
         self._prepare_request_params({"input_id": "test-id"})
     """
+
     method = self.endpoint.method.lower()
     if not method:
       raise ValueError("Operation method not found.")
@@ -255,6 +259,12 @@ class RestApiTool(BaseTool):
     query_params: Dict[str, Any] = {}
     header_params: Dict[str, Any] = {}
     cookie_params: Dict[str, Any] = {}
+
+    from ....version import __version__ as adk_version
+
+    # Set the custom User-Agent header
+    user_agent = f"google-adk/{adk_version} (tool: {self.name})"
+    header_params["User-Agent"] = user_agent
 
     params_map: Dict[str, ApiParameter] = {p.py_name: p for p in parameters}
 
@@ -329,6 +339,9 @@ class RestApiTool(BaseTool):
     filtered_query_params: Dict[str, Any] = {
         k: v for k, v in query_params.items() if v is not None
     }
+
+    for key, value in self._default_headers.items():
+      header_params.setdefault(key, value)
 
     request_params: Dict[str, Any] = {
         "method": method,

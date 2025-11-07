@@ -12,26 +12,30 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for the Response Evaluator."""
-import random
-from unittest.mock import patch
+from __future__ import annotations
 
+"""Tests for the Response Evaluator."""
+import math
+import random
+
+from google.adk.dependencies.vertexai import vertexai
 from google.adk.evaluation.eval_case import Invocation
 from google.adk.evaluation.evaluator import EvalStatus
 from google.adk.evaluation.vertex_ai_eval_facade import _VertexAiEvalFacade
 from google.genai import types as genai_types
 import pytest
-from vertexai import types as vertexai_types
+
+vertexai_types = vertexai.types
 
 
-@patch(
-    "google.adk.evaluation.vertex_ai_eval_facade._VertexAiEvalFacade._perform_eval"
-)
 class TestVertexAiEvalFacade:
   """A class to help organize "patch" that are applicable to all tests."""
 
-  def test_evaluate_invocations_metric_passed(self, mock_perform_eval):
+  def test_evaluate_invocations_metric_passed(self, mocker):
     """Test evaluate_invocations function for a metric."""
+    mock_perform_eval = mocker.patch(
+        "google.adk.evaluation.vertex_ai_eval_facade._VertexAiEvalFacade._perform_eval"
+    )
     actual_invocations = [
         Invocation(
             user_content=genai_types.Content(
@@ -76,8 +80,11 @@ class TestVertexAiEvalFacade:
         vertexai_types.PrebuiltMetric.COHERENCE.name
     ]
 
-  def test_evaluate_invocations_metric_failed(self, mock_perform_eval):
+  def test_evaluate_invocations_metric_failed(self, mocker):
     """Test evaluate_invocations function for a metric."""
+    mock_perform_eval = mocker.patch(
+        "google.adk.evaluation.vertex_ai_eval_facade._VertexAiEvalFacade._perform_eval"
+    )
     actual_invocations = [
         Invocation(
             user_content=genai_types.Content(
@@ -122,8 +129,22 @@ class TestVertexAiEvalFacade:
         vertexai_types.PrebuiltMetric.COHERENCE.name
     ]
 
-  def test_evaluate_invocations_metric_no_score(self, mock_perform_eval):
+  @pytest.mark.parametrize(
+      "summary_metric_with_no_score",
+      [
+          ([]),
+          ([vertexai_types.AggregatedMetricResult(mean_score=float("nan"))]),
+          ([vertexai_types.AggregatedMetricResult(mean_score=None)]),
+          ([vertexai_types.AggregatedMetricResult(mean_score=math.nan)]),
+      ],
+  )
+  def test_evaluate_invocations_metric_no_score(
+      self, mocker, summary_metric_with_no_score
+  ):
     """Test evaluate_invocations function for a metric."""
+    mock_perform_eval = mocker.patch(
+        "google.adk.evaluation.vertex_ai_eval_facade._VertexAiEvalFacade._perform_eval"
+    )
     actual_invocations = [
         Invocation(
             user_content=genai_types.Content(
@@ -151,7 +172,7 @@ class TestVertexAiEvalFacade:
     )
     # Mock the return value of _perform_eval
     mock_perform_eval.return_value = vertexai_types.EvaluationResult(
-        summary_metrics=[],
+        summary_metrics=summary_metric_with_no_score,
         eval_case_results=[],
     )
 
@@ -168,10 +189,11 @@ class TestVertexAiEvalFacade:
         vertexai_types.PrebuiltMetric.COHERENCE.name
     ]
 
-  def test_evaluate_invocations_metric_multiple_invocations(
-      self, mock_perform_eval
-  ):
+  def test_evaluate_invocations_metric_multiple_invocations(self, mocker):
     """Test evaluate_invocations function for a metric with multiple invocations."""
+    mock_perform_eval = mocker.patch(
+        "google.adk.evaluation.vertex_ai_eval_facade._VertexAiEvalFacade._perform_eval"
+    )
     num_invocations = 6
     actual_invocations = []
     expected_invocations = []

@@ -19,6 +19,8 @@ from typing import TYPE_CHECKING
 from google.genai import types
 from typing_extensions import override
 
+from ..utils.model_name_utils import is_gemini_1_model
+from ..utils.model_name_utils import is_gemini_model
 from .base_tool import BaseTool
 from .tool_context import ToolContext
 
@@ -33,9 +35,17 @@ class GoogleSearchTool(BaseTool):
   local code execution.
   """
 
-  def __init__(self):
+  def __init__(self, *, bypass_multi_tools_limit: bool = False):
+    """Initializes the Google search tool.
+
+    Args:
+      bypass_multi_tools_limit: Whether to bypass the multi tools limitation,
+        so that the tool can be used with other tools in the same agent.
+    """
+
     # Name and description are not used because this is a model built-in tool.
     super().__init__(name='google_search', description='google_search')
+    self.bypass_multi_tools_limit = bypass_multi_tools_limit
 
   @override
   async def process_llm_request(
@@ -46,15 +56,15 @@ class GoogleSearchTool(BaseTool):
   ) -> None:
     llm_request.config = llm_request.config or types.GenerateContentConfig()
     llm_request.config.tools = llm_request.config.tools or []
-    if llm_request.model and 'gemini-1' in llm_request.model:
+    if is_gemini_1_model(llm_request.model):
       if llm_request.config.tools:
         raise ValueError(
-            'Google search tool can not be used with other tools in Gemini 1.x.'
+            'Google search tool cannot be used with other tools in Gemini 1.x.'
         )
       llm_request.config.tools.append(
           types.Tool(google_search_retrieval=types.GoogleSearchRetrieval())
       )
-    elif llm_request.model and 'gemini-' in llm_request.model:
+    elif is_gemini_model(llm_request.model):
       llm_request.config.tools.append(
           types.Tool(google_search=types.GoogleSearch())
       )

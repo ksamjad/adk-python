@@ -17,6 +17,8 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import os
+import re
 from typing import Any
 from typing import AsyncGenerator
 from typing import cast
@@ -27,7 +29,9 @@ from typing import List
 from typing import Literal
 from typing import Optional
 from typing import Tuple
+from typing import TypedDict
 from typing import Union
+import warnings
 
 from google.genai import types
 import litellm
@@ -35,12 +39,9 @@ from litellm import acompletion
 from litellm import ChatCompletionAssistantMessage
 from litellm import ChatCompletionAssistantToolCall
 from litellm import ChatCompletionDeveloperMessage
-from litellm import ChatCompletionImageUrlObject
 from litellm import ChatCompletionMessageToolCall
-from litellm import ChatCompletionTextObject
 from litellm import ChatCompletionToolMessage
 from litellm import ChatCompletionUserMessage
-from litellm import ChatCompletionVideoUrlObject
 from litellm import completion
 from litellm import CustomStreamWrapper
 from litellm import Function
@@ -62,6 +63,32 @@ logger = logging.getLogger("google_adk." + __name__)
 
 _NEW_LINE = "\n"
 _EXCLUDED_PART_FIELD = {"inline_data": {"data"}}
+_LITELLM_STRUCTURED_TYPES = {"json_object", "json_schema"}
+
+# Mapping of LiteLLM finish_reason strings to FinishReason enum values
+# Note: tool_calls/function_call map to STOP because:
+# 1. FinishReason.TOOL_CALL enum does not exist (as of google-genai 0.8.0)
+# 2. Tool calls represent normal completion (model stopped to invoke tools)
+# 3. Gemini native responses use STOP for tool calls (see lite_llm.py:910)
+_FINISH_REASON_MAPPING = {
+    "length": types.FinishReason.MAX_TOKENS,
+    "stop": types.FinishReason.STOP,
+    "tool_calls": (
+        types.FinishReason.STOP
+    ),  # Normal completion with tool invocation
+    "function_call": types.FinishReason.STOP,  # Legacy function call variant
+    "content_filter": types.FinishReason.SAFETY,
+}
+
+_SUPPORTED_FILE_CONTENT_MIME_TYPES = set(
+    ["application/pdf", "application/json", "text/plain"]
+)
+
+
+class ChatCompletionFileUrlObject(TypedDict, total=False):
+  file_data: str
+  file_id: str
+  format: str
 
 
 class FunctionChunk(BaseModel):
@@ -79,6 +106,7 @@ class UsageMetadataChunk(BaseModel):
   prompt_tokens: int
   completion_tokens: int
   total_tokens: int
+  cached_prompt_tokens: int = 0
 
 
 class LiteLLMClient:
@@ -146,6 +174,106 @@ def _safe_json_serialize(obj) -> str:
     return json.dumps(obj, ensure_ascii=False)
   except (TypeError, OverflowError):
     return str(obj)
+
+
+def _part_has_payload(part: types.Part) -> bool:
+  """Checks whether a Part contains usable payload for the model."""
+  if part.text:
+    return True
+  if part.inline_data and part.inline_data.data:
+    return True
+  if part.file_data and (part.file_data.file_uri or part.file_data.data):
+    return True
+  return False
+
+
+def _append_fallback_user_content_if_missing(
+    llm_request: LlmRequest,
+) -> None:
+  """Ensures there is a user message with content for LiteLLM backends.
+
+  Args:
+    llm_request: The request that may need a fallback user message.
+  """
+  for content in reversed(llm_request.contents):
+    if content.role == "user":
+      parts = content.parts or []
+      if any(_part_has_payload(part) for part in parts):
+        return
+      if not parts:
+        content.parts = []
+      content.parts.append(
+          types.Part.from_text(
+              text="Handle the requests as specified in the System Instruction."
+          )
+      )
+      return
+  llm_request.contents.append(
+      types.Content(
+          role="user",
+          parts=[
+              types.Part.from_text(
+                  text=(
+                      "Handle the requests as specified in the System"
+                      " Instruction."
+                  )
+              ),
+          ],
+      )
+  )
+
+
+def _extract_cached_prompt_tokens(usage: Any) -> int:
+  """Extracts cached prompt tokens from LiteLLM usage.
+
+  Providers expose cached token metrics in different shapes. Common patterns:
+  - usage["prompt_tokens_details"]["cached_tokens"] (OpenAI/Azure style)
+  - usage["prompt_tokens_details"] is a list of dicts with cached_tokens
+  - usage["cached_prompt_tokens"] (LiteLLM-normalized for some providers)
+  - usage["cached_tokens"] (flat)
+
+  Args:
+    usage: Usage dictionary from LiteLLM response.
+
+  Returns:
+    Integer number of cached prompt tokens if present; otherwise 0.
+  """
+  try:
+    usage_dict = usage
+    if hasattr(usage, "model_dump"):
+      usage_dict = usage.model_dump()
+    elif isinstance(usage, str):
+      try:
+        usage_dict = json.loads(usage)
+      except json.JSONDecodeError:
+        return 0
+
+    if not isinstance(usage_dict, dict):
+      return 0
+
+    details = usage_dict.get("prompt_tokens_details")
+    if isinstance(details, dict):
+      value = details.get("cached_tokens")
+      if isinstance(value, int):
+        return value
+    elif isinstance(details, list):
+      total = sum(
+          item.get("cached_tokens", 0)
+          for item in details
+          if isinstance(item, dict)
+          and isinstance(item.get("cached_tokens"), int)
+      )
+      if total > 0:
+        return total
+
+    for key in ("cached_prompt_tokens", "cached_tokens"):
+      value = usage_dict.get(key)
+      if isinstance(value, int):
+        return value
+  except (TypeError, AttributeError) as e:
+    logger.debug("Error extracting cached prompt tokens: %s", e)
+
+  return 0
 
 
 def _content_to_message_param(
@@ -234,12 +362,10 @@ def _get_content(
     if part.text:
       if len(parts) == 1:
         return part.text
-      content_objects.append(
-          ChatCompletionTextObject(
-              type="text",
-              text=part.text,
-          )
-      )
+      content_objects.append({
+          "type": "text",
+          "text": part.text,
+      })
     elif (
         part.inline_data
         and part.inline_data.data
@@ -247,23 +373,39 @@ def _get_content(
     ):
       base64_string = base64.b64encode(part.inline_data.data).decode("utf-8")
       data_uri = f"data:{part.inline_data.mime_type};base64,{base64_string}"
+      # LiteLLM providers extract the MIME type from the data URI; avoid
+      # passing a separate `format` field that some backends reject.
 
       if part.inline_data.mime_type.startswith("image"):
-        content_objects.append(
-            ChatCompletionImageUrlObject(
-                type="image_url",
-                image_url=data_uri,
-            )
-        )
+        content_objects.append({
+            "type": "image_url",
+            "image_url": {"url": data_uri},
+        })
       elif part.inline_data.mime_type.startswith("video"):
-        content_objects.append(
-            ChatCompletionVideoUrlObject(
-                type="video_url",
-                video_url=data_uri,
-            )
-        )
+        content_objects.append({
+            "type": "video_url",
+            "video_url": {"url": data_uri},
+        })
+      elif part.inline_data.mime_type.startswith("audio"):
+        content_objects.append({
+            "type": "audio_url",
+            "audio_url": {"url": data_uri},
+        })
+      elif part.inline_data.mime_type in _SUPPORTED_FILE_CONTENT_MIME_TYPES:
+        content_objects.append({
+            "type": "file",
+            "file": {"file_data": data_uri},
+        })
       else:
         raise ValueError("LiteLlm(BaseLlm) does not support this content part.")
+    elif part.file_data and part.file_data.file_uri:
+      file_object: ChatCompletionFileUrlObject = {
+          "file_id": part.file_data.file_uri,
+      }
+      content_objects.append({
+          "type": "file",
+          "file": file_object,
+      })
 
   return content_objects
 
@@ -294,7 +436,9 @@ TYPE_LABELS = {
 
 
 def _schema_to_dict(schema: types.Schema) -> dict:
-  """Recursively converts a types.Schema to a dictionary.
+  """Recursively converts a types.Schema to a pure-python dict
+
+  with all enum values written as lower-case strings.
 
   Args:
     schema: The schema to convert.
@@ -302,36 +446,47 @@ def _schema_to_dict(schema: types.Schema) -> dict:
   Returns:
     The dictionary representation of the schema.
   """
-
+  # Dump without json encoding so we still get Enum members
   schema_dict = schema.model_dump(exclude_none=True)
+
+  # ---- normalise this level ------------------------------------------------
   if "type" in schema_dict:
-    schema_dict["type"] = schema_dict["type"].lower()
+    # schema_dict["type"] can be an Enum or a str
+    t = schema_dict["type"]
+    schema_dict["type"] = (t.value if isinstance(t, types.Type) else t).lower()
+
+  # ---- recurse into `items` -----------------------------------------------
   if "items" in schema_dict:
-    if isinstance(schema_dict["items"], dict):
-      schema_dict["items"] = _schema_to_dict(
-          types.Schema.model_validate(schema_dict["items"])
-      )
-    elif isinstance(schema_dict["items"]["type"], types.Type):
-      schema_dict["items"]["type"] = TYPE_LABELS[
-          schema_dict["items"]["type"].value
-      ]
+    schema_dict["items"] = _schema_to_dict(
+        schema.items
+        if isinstance(schema.items, types.Schema)
+        else types.Schema.model_validate(schema_dict["items"])
+    )
+
+  # ---- recurse into `properties` ------------------------------------------
   if "properties" in schema_dict:
-    properties = {}
+    new_props = {}
     for key, value in schema_dict["properties"].items():
-      if isinstance(value, types.Schema):
-        properties[key] = _schema_to_dict(value)
+      # value is a dict → rebuild a Schema object and recurse
+      if isinstance(value, dict):
+        new_props[key] = _schema_to_dict(types.Schema.model_validate(value))
+      # value is already a Schema instance
+      elif isinstance(value, types.Schema):
+        new_props[key] = _schema_to_dict(value)
+      # plain dict without nested schemas
       else:
-        properties[key] = value
-        if "type" in properties[key]:
-          properties[key]["type"] = properties[key]["type"].lower()
-    schema_dict["properties"] = properties
+        new_props[key] = value
+        if "type" in new_props[key]:
+          new_props[key]["type"] = new_props[key]["type"].lower()
+    schema_dict["properties"] = new_props
+
   return schema_dict
 
 
 def _function_declaration_to_tool_param(
     function_declaration: types.FunctionDeclaration,
 ) -> dict:
-  """Converts a types.FunctionDeclaration to a openapi spec dictionary.
+  """Converts a types.FunctionDeclaration to an openapi spec dictionary.
 
   Args:
     function_declaration: The function declaration to convert.
@@ -342,25 +497,43 @@ def _function_declaration_to_tool_param(
 
   assert function_declaration.name
 
-  properties = {}
+  parameters = {
+      "type": "object",
+      "properties": {},
+  }
   if (
       function_declaration.parameters
       and function_declaration.parameters.properties
   ):
+    properties = {}
     for key, value in function_declaration.parameters.properties.items():
       properties[key] = _schema_to_dict(value)
 
-  return {
+    parameters = {
+        "type": "object",
+        "properties": properties,
+    }
+  elif function_declaration.parameters_json_schema:
+    parameters = function_declaration.parameters_json_schema
+
+  tool_params = {
       "type": "function",
       "function": {
           "name": function_declaration.name,
           "description": function_declaration.description or "",
-          "parameters": {
-              "type": "object",
-              "properties": properties,
-          },
+          "parameters": parameters,
       },
   }
+
+  if (
+      function_declaration.parameters
+      and function_declaration.parameters.required
+  ):
+    tool_params["function"]["parameters"][
+        "required"
+    ] = function_declaration.parameters.required
+
+  return tool_params
 
 
 def _model_response_to_chunk(
@@ -397,10 +570,17 @@ def _model_response_to_chunk(
       for tool_call in message.get("tool_calls"):
         # aggregate tool_call
         if tool_call.type == "function":
+          func_name = tool_call.function.name
+          func_args = tool_call.function.arguments
+
+          # Ignore empty chunks that don't carry any information.
+          if not func_name and not func_args:
+            continue
+
           yield FunctionChunk(
               id=tool_call.id,
-              name=tool_call.function.name,
-              args=tool_call.function.arguments,
+              name=func_name,
+              args=func_args,
               index=tool_call.index,
           ), finish_reason
 
@@ -420,6 +600,7 @@ def _model_response_to_chunk(
         prompt_tokens=response["usage"].get("prompt_tokens", 0),
         completion_tokens=response["usage"].get("completion_tokens", 0),
         total_tokens=response["usage"].get("total_tokens", 0),
+        cached_prompt_tokens=_extract_cached_prompt_tokens(response["usage"]),
     ), None
 
 
@@ -436,30 +617,49 @@ def _model_response_to_generate_content_response(
   """
 
   message = None
-  if response.get("choices", None):
-    message = response["choices"][0].get("message", None)
+  finish_reason = None
+  if (choices := response.get("choices")) and choices:
+    first_choice = choices[0]
+    message = first_choice.get("message", None)
+    finish_reason = first_choice.get("finish_reason", None)
 
   if not message:
     raise ValueError("No message in response")
 
-  llm_response = _message_to_generate_content_response(message)
+  llm_response = _message_to_generate_content_response(
+      message, model_version=response.model
+  )
+  if finish_reason:
+    # If LiteLLM already provides a FinishReason enum (e.g., for Gemini), use
+    # it directly. Otherwise, map the finish_reason string to the enum.
+    if isinstance(finish_reason, types.FinishReason):
+      llm_response.finish_reason = finish_reason
+    else:
+      finish_reason_str = str(finish_reason).lower()
+      llm_response.finish_reason = _FINISH_REASON_MAPPING.get(
+          finish_reason_str, types.FinishReason.OTHER
+      )
   if response.get("usage", None):
     llm_response.usage_metadata = types.GenerateContentResponseUsageMetadata(
         prompt_token_count=response["usage"].get("prompt_tokens", 0),
         candidates_token_count=response["usage"].get("completion_tokens", 0),
         total_token_count=response["usage"].get("total_tokens", 0),
+        cached_content_token_count=_extract_cached_prompt_tokens(
+            response["usage"]
+        ),
     )
   return llm_response
 
 
 def _message_to_generate_content_response(
-    message: Message, is_partial: bool = False
+    message: Message, *, is_partial: bool = False, model_version: str = None
 ) -> LlmResponse:
   """Converts a litellm message to LlmResponse.
 
   Args:
     message: The message to convert.
     is_partial: Whether the message is partial.
+    model_version: The model version used to generate the response.
 
   Returns:
     The LlmResponse.
@@ -480,8 +680,48 @@ def _message_to_generate_content_response(
         parts.append(part)
 
   return LlmResponse(
-      content=types.Content(role="model", parts=parts), partial=is_partial
+      content=types.Content(role="model", parts=parts),
+      partial=is_partial,
+      model_version=model_version,
   )
+
+
+def _to_litellm_response_format(
+    response_schema: types.SchemaUnion,
+) -> Optional[Dict[str, Any]]:
+  """Converts ADK response schema objects into LiteLLM-compatible payloads."""
+
+  if isinstance(response_schema, dict):
+    schema_type = response_schema.get("type")
+    if (
+        isinstance(schema_type, str)
+        and schema_type.lower() in _LITELLM_STRUCTURED_TYPES
+    ):
+      return response_schema
+    schema_dict = dict(response_schema)
+  elif isinstance(response_schema, type) and issubclass(
+      response_schema, BaseModel
+  ):
+    schema_dict = response_schema.model_json_schema()
+  elif isinstance(response_schema, BaseModel):
+    if isinstance(response_schema, types.Schema):
+      # GenAI Schema instances already represent JSON schema definitions.
+      schema_dict = response_schema.model_dump(exclude_none=True, mode="json")
+    else:
+      schema_dict = response_schema.__class__.model_json_schema()
+  elif hasattr(response_schema, "model_dump"):
+    schema_dict = response_schema.model_dump(exclude_none=True, mode="json")
+  else:
+    logger.warning(
+        "Unsupported response_schema type %s for LiteLLM structured outputs.",
+        type(response_schema),
+    )
+    return None
+
+  return {
+      "type": "json_object",
+      "response_schema": schema_dict,
+  }
 
 
 def _get_completion_inputs(
@@ -489,7 +729,7 @@ def _get_completion_inputs(
 ) -> Tuple[
     List[Message],
     Optional[List[Dict]],
-    Optional[types.SchemaUnion],
+    Optional[Dict[str, Any]],
     Optional[Dict],
 ]:
   """Converts an LlmRequest to litellm inputs and extracts generation params.
@@ -498,7 +738,8 @@ def _get_completion_inputs(
     llm_request: The LlmRequest to convert.
 
   Returns:
-    The litellm inputs (message list, tool dictionary, response format and generation params).
+    The litellm inputs (message list, tool dictionary, response format and
+    generation params).
   """
   # 1. Construct messages
   messages: List[Message] = []
@@ -531,9 +772,11 @@ def _get_completion_inputs(
     ]
 
   # 3. Handle response format
-  response_format: Optional[types.SchemaUnion] = None
+  response_format: Optional[Dict[str, Any]] = None
   if llm_request.config and llm_request.config.response_schema:
-    response_format = llm_request.config.response_schema
+    response_format = _to_litellm_response_format(
+        llm_request.config.response_schema
+    )
 
   # 4. Extract generation parameters
   generation_params: Optional[Dict] = None
@@ -559,8 +802,8 @@ def _get_completion_inputs(
         mapped_key = param_mapping.get(key, key)
         generation_params[mapped_key] = config_dict[key]
 
-      if not generation_params:
-        generation_params = None
+    if not generation_params:
+      generation_params = None
 
   return messages, tools, response_format, generation_params
 
@@ -638,6 +881,67 @@ Functions:
 """
 
 
+def _is_litellm_gemini_model(model_string: str) -> bool:
+  """Check if the model is a Gemini model accessed via LiteLLM.
+
+  Args:
+    model_string: A LiteLLM model string (e.g., "gemini/gemini-2.5-pro" or
+      "vertex_ai/gemini-2.5-flash")
+
+  Returns:
+    True if it's a Gemini model accessed via LiteLLM, False otherwise
+  """
+  # Matches "gemini/gemini-*" (Google AI Studio) or "vertex_ai/gemini-*" (Vertex AI).
+  pattern = r"^(gemini|vertex_ai)/gemini-"
+  return bool(re.match(pattern, model_string))
+
+
+def _extract_gemini_model_from_litellm(litellm_model: str) -> str:
+  """Extract the pure Gemini model name from a LiteLLM model string.
+
+  Args:
+    litellm_model: LiteLLM model string like "gemini/gemini-2.5-pro"
+
+  Returns:
+    Pure Gemini model name like "gemini-2.5-pro"
+  """
+  # Remove LiteLLM provider prefix
+  if "/" in litellm_model:
+    return litellm_model.split("/", 1)[1]
+  return litellm_model
+
+
+def _warn_gemini_via_litellm(model_string: str) -> None:
+  """Warn if Gemini is being used via LiteLLM.
+
+  This function logs a warning suggesting users use Gemini directly rather than
+  through LiteLLM for better performance and features.
+
+  Args:
+    model_string: The LiteLLM model string to check
+  """
+  if not _is_litellm_gemini_model(model_string):
+    return
+
+  # Check if warning should be suppressed via environment variable
+  if os.environ.get(
+      "ADK_SUPPRESS_GEMINI_LITELLM_WARNINGS", ""
+  ).strip().lower() in ("1", "true", "yes", "on"):
+    return
+
+  warnings.warn(
+      f"[GEMINI_VIA_LITELLM] {model_string}: You are using Gemini via LiteLLM."
+      " For better performance, reliability, and access to latest features,"
+      " consider using Gemini directly through ADK's native Gemini"
+      f" integration. Replace LiteLlm(model='{model_string}') with"
+      f" Gemini(model='{_extract_gemini_model_from_litellm(model_string)}')."
+      " Set ADK_SUPPRESS_GEMINI_LITELLM_WARNINGS=true to suppress this"
+      " warning.",
+      category=UserWarning,
+      stacklevel=3,
+  )
+
+
 class LiteLlm(BaseLlm):
   """Wrapper around litellm.
 
@@ -673,8 +977,11 @@ class LiteLlm(BaseLlm):
       model: The name of the LiteLlm model.
       **kwargs: Additional arguments to pass to the litellm completion api.
     """
+    drop_params = kwargs.pop("drop_params", None)
     super().__init__(model=model, **kwargs)
-    self._additional_args = kwargs
+    # Warn if using Gemini via LiteLLM
+    _warn_gemini_via_litellm(model)
+    self._additional_args = dict(kwargs)
     # preventing generation call with llm_client
     # and overriding messages, tools and stream which are managed internally
     self._additional_args.pop("llm_client", None)
@@ -682,6 +989,8 @@ class LiteLlm(BaseLlm):
     self._additional_args.pop("tools", None)
     # public api called from runner determines to stream or not
     self._additional_args.pop("stream", None)
+    if drop_params is not None:
+      self._additional_args["drop_params"] = drop_params
 
   async def generate_content_async(
       self, llm_request: LlmRequest, stream: bool = False
@@ -697,6 +1006,7 @@ class LiteLlm(BaseLlm):
     """
 
     self._maybe_append_user_content(llm_request)
+    _append_fallback_user_content_if_missing(llm_request)
     logger.debug(_build_request_log(llm_request))
 
     messages, tools, response_format, generation_params = (
@@ -708,7 +1018,7 @@ class LiteLlm(BaseLlm):
       tools = None
 
     completion_args = {
-        "model": self.model,
+        "model": llm_request.model or self.model,
         "messages": messages,
         "tools": tools,
         "response_format": response_format,
@@ -723,6 +1033,7 @@ class LiteLlm(BaseLlm):
       # Track function calls by index
       function_calls = {}  # index -> {name, args, id}
       completion_args["stream"] = True
+      completion_args["stream_options"] = {"include_usage": True}
       aggregated_llm_response = None
       aggregated_llm_response_with_tool_call = None
       usage_metadata = None
@@ -758,12 +1069,14 @@ class LiteLlm(BaseLlm):
                     content=chunk.text,
                 ),
                 is_partial=True,
+                model_version=part.model,
             )
           elif isinstance(chunk, UsageMetadataChunk):
             usage_metadata = types.GenerateContentResponseUsageMetadata(
                 prompt_token_count=chunk.prompt_tokens,
                 candidates_token_count=chunk.completion_tokens,
                 total_token_count=chunk.total_tokens,
+                cached_content_token_count=chunk.cached_prompt_tokens,
             )
 
           if (
@@ -789,14 +1102,16 @@ class LiteLlm(BaseLlm):
                         role="assistant",
                         content=text,
                         tool_calls=tool_calls,
-                    )
+                    ),
+                    model_version=part.model,
                 )
             )
             text = ""
             function_calls.clear()
           elif finish_reason == "stop" and text:
             aggregated_llm_response = _message_to_generate_content_response(
-                ChatCompletionAssistantMessage(role="assistant", content=text)
+                ChatCompletionAssistantMessage(role="assistant", content=text),
+                model_version=part.model,
             )
             text = ""
 
@@ -818,9 +1133,9 @@ class LiteLlm(BaseLlm):
       response = await self.llm_client.acompletion(**completion_args)
       yield _model_response_to_generate_content_response(response)
 
-  @staticmethod
+  @classmethod
   @override
-  def supported_models() -> list[str]:
+  def supported_models(cls) -> list[str]:
     """Provides the list of supported models.
 
     LiteLlm supports all models supported by litellm. We do not keep track of

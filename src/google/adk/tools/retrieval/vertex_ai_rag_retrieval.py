@@ -22,13 +22,14 @@ from typing import TYPE_CHECKING
 
 from google.genai import types
 from typing_extensions import override
-from vertexai.preview import rag
 
+from ...utils.model_name_utils import is_gemini_2_or_above
 from ..tool_context import ToolContext
 from .base_retrieval_tool import BaseRetrievalTool
 
 if TYPE_CHECKING:
-  from ...models.llm_request import LlmRequest
+  from ...dependencies.vertexai import rag
+  from ...models import LlmRequest
 
 logger = logging.getLogger('google_adk.' + __name__)
 
@@ -62,7 +63,7 @@ class VertexAiRagRetrieval(BaseRetrievalTool):
       llm_request: LlmRequest,
   ) -> None:
     # Use Gemini built-in Vertex AI RAG tool for Gemini 2 models.
-    if llm_request.model and llm_request.model.startswith('gemini-2'):
+    if is_gemini_2_or_above(llm_request.model):
       llm_request.config = (
           types.GenerateContentConfig()
           if not llm_request.config
@@ -89,6 +90,7 @@ class VertexAiRagRetrieval(BaseRetrievalTool):
       args: dict[str, Any],
       tool_context: ToolContext,
   ) -> Any:
+    from ...dependencies.vertexai import rag
 
     response = rag.retrieval_query(
         text=args['query'],

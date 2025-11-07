@@ -20,6 +20,8 @@ from typing import TYPE_CHECKING
 from google.genai import types
 from typing_extensions import override
 
+from ..utils.model_name_utils import is_gemini_1_model
+from ..utils.model_name_utils import is_gemini_model
 from .base_tool import BaseTool
 from .tool_context import ToolContext
 
@@ -45,6 +47,7 @@ class VertexAiSearchTool(BaseTool):
       search_engine_id: Optional[str] = None,
       filter: Optional[str] = None,
       max_results: Optional[int] = None,
+      bypass_multi_tools_limit: bool = False,
   ):
     """Initializes the Vertex AI Search tool.
 
@@ -56,6 +59,10 @@ class VertexAiSearchTool(BaseTool):
         searched. It should only be set if engine is used.
       search_engine_id: The Vertex AI search engine resource ID in the format of
         "projects/{project}/locations/{location}/collections/{collection}/engines/{engine}".
+      filter: The filter to apply to the search results.
+      max_results: The maximum number of results to return.
+      bypass_multi_tools_limit: Whether to bypass the multi tools limitation,
+        so that the tool can be used with other tools in the same agent.
 
     Raises:
       ValueError: If both data_store_id and search_engine_id are not specified
@@ -78,6 +85,7 @@ class VertexAiSearchTool(BaseTool):
     self.search_engine_id = search_engine_id
     self.filter = filter
     self.max_results = max_results
+    self.bypass_multi_tools_limit = bypass_multi_tools_limit
 
   @override
   async def process_llm_request(
@@ -86,10 +94,10 @@ class VertexAiSearchTool(BaseTool):
       tool_context: ToolContext,
       llm_request: LlmRequest,
   ) -> None:
-    if llm_request.model and 'gemini-' in llm_request.model:
-      if 'gemini-1' in llm_request.model and llm_request.config.tools:
+    if is_gemini_model(llm_request.model):
+      if is_gemini_1_model(llm_request.model) and llm_request.config.tools:
         raise ValueError(
-            'Vertex AI search tool can not be used with other tools in Gemini'
+            'Vertex AI search tool cannot be used with other tools in Gemini'
             ' 1.x.'
         )
       llm_request.config = llm_request.config or types.GenerateContentConfig()

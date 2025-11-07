@@ -29,10 +29,8 @@ try:
   from a2a.types import Message
   from a2a.types import Role
   from a2a.types import Task
-  from a2a.types import TaskArtifactUpdateEvent
   from a2a.types import TaskState
   from a2a.types import TaskStatusUpdateEvent
-  from google.adk.a2a.converters.event_converter import _convert_artifact_to_a2a_events
   from google.adk.a2a.converters.event_converter import _create_artifact_id
   from google.adk.a2a.converters.event_converter import _create_error_status_event
   from google.adk.a2a.converters.event_converter import _create_status_update_event
@@ -41,6 +39,7 @@ try:
   from google.adk.a2a.converters.event_converter import _process_long_running_tool
   from google.adk.a2a.converters.event_converter import _serialize_metadata_value
   from google.adk.a2a.converters.event_converter import ARTIFACT_ID_SEPARATOR
+  from google.adk.a2a.converters.event_converter import convert_a2a_task_to_event
   from google.adk.a2a.converters.event_converter import convert_event_to_a2a_events
   from google.adk.a2a.converters.event_converter import convert_event_to_a2a_message
   from google.adk.a2a.converters.event_converter import DEFAULT_ERROR_MESSAGE
@@ -50,35 +49,10 @@ try:
   from google.adk.events.event_actions import EventActions
 except ImportError as e:
   if sys.version_info < (3, 10):
-    # Create dummy classes to prevent NameError during test collection
-    # Tests will be skipped anyway due to pytestmark
-    class DummyTypes:
-      pass
-
-    DataPart = DummyTypes()
-    Message = DummyTypes()
-    Role = DummyTypes()
-    Task = DummyTypes()
-    TaskArtifactUpdateEvent = DummyTypes()
-    TaskState = DummyTypes()
-    TaskStatusUpdateEvent = DummyTypes()
-    _convert_artifact_to_a2a_events = lambda *args: None
-    _create_artifact_id = lambda *args: None
-    _create_error_status_event = lambda *args: None
-    _create_status_update_event = lambda *args: None
-    _get_adk_metadata_key = lambda *args: None
-    _get_context_metadata = lambda *args: None
-    _process_long_running_tool = lambda *args: None
-    _serialize_metadata_value = lambda *args: None
-    ADK_METADATA_KEY_PREFIX = "adk_"
-    ARTIFACT_ID_SEPARATOR = "_"
-    convert_event_to_a2a_events = lambda *args: None
-    convert_event_to_a2a_message = lambda *args: None
-    DEFAULT_ERROR_MESSAGE = "error"
-    InvocationContext = DummyTypes()
-    Event = DummyTypes()
-    EventActions = DummyTypes()
-    types = DummyTypes()
+    # Imports are not needed since tests will be skipped due to pytestmark.
+    # The imported names are only used within test methods, not at module level,
+    # so no NameError occurs during module compilation.
+    pass
   else:
     raise e
 
@@ -228,90 +202,6 @@ class TestEventConverter:
 
     assert result == expected
 
-  @patch(
-      "google.adk.a2a.converters.event_converter.convert_genai_part_to_a2a_part"
-  )
-  def test_convert_artifact_to_a2a_events_success(self, mock_convert_part):
-    """Test successful artifact delta conversion."""
-    filename = "test.txt"
-    version = 1
-    task_id = "test-task-id"
-    context_id = "test-context-id"
-
-    mock_artifact_part = Mock()
-    # Create a proper Part that Pydantic will accept
-    from a2a.types import Part
-    from a2a.types import TextPart
-
-    text_part = TextPart(text="test content")
-    mock_converted_part = Part(root=text_part)
-
-    self.mock_artifact_service.load_artifact.return_value = mock_artifact_part
-    mock_convert_part.return_value = mock_converted_part
-
-    result = _convert_artifact_to_a2a_events(
-        self.mock_event,
-        self.mock_invocation_context,
-        filename,
-        version,
-        task_id,
-        context_id,
-    )
-
-    assert isinstance(result, TaskArtifactUpdateEvent)
-    assert result.taskId == task_id
-    assert result.contextId == context_id
-    assert result.append is False
-    assert result.lastChunk is True
-
-    # Check artifact properties
-    assert result.artifact.name == filename
-    assert result.artifact.metadata["filename"] == filename
-    assert result.artifact.metadata["version"] == version
-    assert len(result.artifact.parts) == 1
-    assert result.artifact.parts[0].root.text == "test content"
-
-  def test_convert_artifact_to_a2a_events_empty_filename(self):
-    """Test artifact delta conversion with empty filename."""
-    with pytest.raises(ValueError) as exc_info:
-      _convert_artifact_to_a2a_events(
-          self.mock_event, self.mock_invocation_context, "", 1, "", ""
-      )
-    assert "Filename cannot be empty" in str(exc_info.value)
-
-  def test_convert_artifact_to_a2a_events_negative_version(self):
-    """Test artifact delta conversion with negative version."""
-    with pytest.raises(ValueError) as exc_info:
-      _convert_artifact_to_a2a_events(
-          self.mock_event, self.mock_invocation_context, "test.txt", -1, "", ""
-      )
-    assert "Version must be non-negative" in str(exc_info.value)
-
-  @patch(
-      "google.adk.a2a.converters.event_converter.convert_genai_part_to_a2a_part"
-  )
-  def test_convert_artifact_to_a2a_events_conversion_failure(
-      self, mock_convert_part
-  ):
-    """Test artifact delta conversion when part conversion fails."""
-    filename = "test.txt"
-    version = 1
-
-    mock_artifact_part = Mock()
-    self.mock_artifact_service.load_artifact.return_value = mock_artifact_part
-    mock_convert_part.return_value = None  # Simulate conversion failure
-
-    with pytest.raises(RuntimeError) as exc_info:
-      _convert_artifact_to_a2a_events(
-          self.mock_event,
-          self.mock_invocation_context,
-          filename,
-          version,
-          "",
-          "",
-      )
-    assert "Failed to convert artifact part" in str(exc_info.value)
-
   def test_process_long_running_tool_marks_tool(self):
     """Test processing of long-running tool metadata."""
     mock_a2a_part = Mock()
@@ -375,174 +265,6 @@ class TestEventConverter:
       assert expected_key not in mock_data_part.metadata
 
   @patch(
-      "google.adk.a2a.converters.event_converter.convert_genai_part_to_a2a_part"
-  )
-  @patch("google.adk.a2a.converters.event_converter.uuid.uuid4")
-  def test_convert_event_to_message_success(self, mock_uuid, mock_convert_part):
-    """Test successful event to message conversion."""
-    mock_uuid.return_value = "test-uuid"
-
-    mock_part = Mock()
-    # Create a proper Part that Pydantic will accept
-    from a2a.types import Part
-    from a2a.types import TextPart
-
-    text_part = TextPart(text="test message")
-    mock_a2a_part = Part(root=text_part)
-    mock_convert_part.return_value = mock_a2a_part
-
-    mock_content = Mock()
-    mock_content.parts = [mock_part]
-    self.mock_event.content = mock_content
-
-    result = convert_event_to_a2a_message(
-        self.mock_event, self.mock_invocation_context
-    )
-
-    assert isinstance(result, Message)
-    assert result.messageId == "test-uuid"
-    assert result.role == Role.agent
-    assert len(result.parts) == 1
-    assert result.parts[0].root.text == "test message"
-
-  def test_convert_event_to_message_no_content(self):
-    """Test event to message conversion with no content."""
-    self.mock_event.content = None
-
-    result = convert_event_to_a2a_message(
-        self.mock_event, self.mock_invocation_context
-    )
-
-    assert result is None
-
-  def test_convert_event_to_message_empty_parts(self):
-    """Test event to message conversion with empty parts."""
-    mock_content = Mock()
-    mock_content.parts = []
-    self.mock_event.content = mock_content
-
-    result = convert_event_to_a2a_message(
-        self.mock_event, self.mock_invocation_context
-    )
-
-    assert result is None
-
-  def test_convert_event_to_message_none_event(self):
-    """Test event to message conversion with None event."""
-    with pytest.raises(ValueError) as exc_info:
-      convert_event_to_a2a_message(None, self.mock_invocation_context)
-    assert "Event cannot be None" in str(exc_info.value)
-
-  def test_convert_event_to_message_none_context(self):
-    """Test event to message conversion with None context."""
-    with pytest.raises(ValueError) as exc_info:
-      convert_event_to_a2a_message(self.mock_event, None)
-    assert "Invocation context cannot be None" in str(exc_info.value)
-
-  @patch(
-      "google.adk.a2a.converters.event_converter.convert_genai_part_to_a2a_part"
-  )
-  @patch("google.adk.a2a.converters.event_converter.uuid.uuid4")
-  def test_convert_event_to_message_with_custom_role(
-      self, mock_uuid, mock_convert_part
-  ):
-    """Test event to message conversion with custom role."""
-    mock_uuid.return_value = "test-uuid"
-
-    mock_part = Mock()
-    # Create a proper Part that Pydantic will accept
-    from a2a.types import Part
-    from a2a.types import TextPart
-
-    text_part = TextPart(text="test message")
-    mock_a2a_part = Part(root=text_part)
-    mock_convert_part.return_value = mock_a2a_part
-
-    mock_content = Mock()
-    mock_content.parts = [mock_part]
-    self.mock_event.content = mock_content
-
-    result = convert_event_to_a2a_message(
-        self.mock_event, self.mock_invocation_context, role=Role.user
-    )
-
-    assert isinstance(result, Message)
-    assert result.messageId == "test-uuid"
-    assert result.role == Role.user
-    assert len(result.parts) == 1
-    assert result.parts[0].root.text == "test message"
-
-  @patch("google.adk.a2a.converters.event_converter.uuid.uuid4")
-  @patch("google.adk.a2a.converters.event_converter.datetime")
-  def test_create_error_status_event(self, mock_datetime, mock_uuid):
-    """Test creation of error status event."""
-    mock_uuid.return_value = "test-uuid"
-    mock_datetime.now.return_value.isoformat.return_value = (
-        "2023-01-01T00:00:00"
-    )
-
-    self.mock_event.error_message = "Test error message"
-    task_id = "test-task-id"
-    context_id = "test-context-id"
-
-    result = _create_error_status_event(
-        self.mock_event, self.mock_invocation_context, task_id, context_id
-    )
-
-    assert isinstance(result, TaskStatusUpdateEvent)
-    assert result.taskId == task_id
-    assert result.contextId == context_id
-    assert result.status.state == TaskState.failed
-    assert result.status.message.parts[0].root.text == "Test error message"
-
-  @patch("google.adk.a2a.converters.event_converter.uuid.uuid4")
-  @patch("google.adk.a2a.converters.event_converter.datetime")
-  def test_create_error_status_event_no_message(self, mock_datetime, mock_uuid):
-    """Test creation of error status event without error message."""
-    mock_uuid.return_value = "test-uuid"
-    mock_datetime.now.return_value.isoformat.return_value = (
-        "2023-01-01T00:00:00"
-    )
-
-    task_id = "test-task-id"
-    context_id = "test-context-id"
-
-    result = _create_error_status_event(
-        self.mock_event, self.mock_invocation_context, task_id, context_id
-    )
-
-    assert result.status.message.parts[0].root.text == DEFAULT_ERROR_MESSAGE
-
-  @patch("google.adk.a2a.converters.event_converter.datetime")
-  def test_create_running_status_event(self, mock_datetime):
-    """Test creation of running status event."""
-    mock_datetime.now.return_value.isoformat.return_value = (
-        "2023-01-01T00:00:00"
-    )
-
-    mock_message = Mock(spec=Message)
-    mock_message.parts = []
-    task_id = "test-task-id"
-    context_id = "test-context-id"
-
-    result = _create_status_update_event(
-        mock_message,
-        self.mock_invocation_context,
-        self.mock_event,
-        task_id,
-        context_id,
-    )
-
-    assert isinstance(result, TaskStatusUpdateEvent)
-    assert result.taskId == task_id
-    assert result.contextId == context_id
-    assert result.status.state == TaskState.working
-    assert result.status.message == mock_message
-
-  @patch(
-      "google.adk.a2a.converters.event_converter._convert_artifact_to_a2a_events"
-  )
-  @patch(
       "google.adk.a2a.converters.event_converter.convert_event_to_a2a_message"
   )
   @patch("google.adk.a2a.converters.event_converter._create_error_status_event")
@@ -554,12 +276,8 @@ class TestEventConverter:
       mock_create_running,
       mock_create_error,
       mock_convert_message,
-      mock_convert_artifact,
   ):
     """Test full event to A2A events conversion scenario."""
-    # Setup artifact delta
-    self.mock_event.actions.artifact_delta = {"file1.txt": 1, "file2.txt": 2}
-
     # Setup error
     self.mock_event.error_code = "ERROR_001"
 
@@ -568,13 +286,6 @@ class TestEventConverter:
     mock_convert_message.return_value = mock_message
 
     # Setup mock returns
-    mock_artifact_event1 = Mock()
-    mock_artifact_event2 = Mock()
-    mock_convert_artifact.side_effect = [
-        mock_artifact_event1,
-        mock_artifact_event2,
-    ]
-
     mock_error_event = Mock()
     mock_create_error.return_value = mock_error_event
 
@@ -584,9 +295,6 @@ class TestEventConverter:
     result = convert_event_to_a2a_events(
         self.mock_event, self.mock_invocation_context
     )
-
-    # Verify artifact delta events
-    assert mock_convert_artifact.call_count == 2
 
     # Verify error event - now called with task_id and context_id parameters
     mock_create_error.assert_called_once_with(
@@ -599,9 +307,7 @@ class TestEventConverter:
     )
 
     # Verify result contains all events
-    assert len(result) == 4  # 2 artifact + 1 error + 1 running
-    assert mock_artifact_event1 in result
-    assert mock_artifact_event2 in result
+    assert len(result) == 2  # 1 error + 1 running
     assert mock_error_event in result
     assert mock_running_event in result
 
@@ -706,11 +412,8 @@ class TestEventConverter:
             context_id,
         )
 
-  def test_convert_event_to_a2a_events_with_artifacts_and_custom_ids(self):
-    """Test event to A2A events conversion with artifacts and custom IDs."""
-    # Setup artifact delta
-    self.mock_event.actions.artifact_delta = {"file1.txt": 1}
-
+  def test_convert_event_to_a2a_events_with_custom_ids(self):
+    """Test event to A2A events conversion with custom IDs."""
     # Setup message
     mock_message = Mock(spec=Message)
     mock_message.parts = []
@@ -721,46 +424,29 @@ class TestEventConverter:
       mock_convert_message.return_value = mock_message
 
       with patch(
-          "google.adk.a2a.converters.event_converter._convert_artifact_to_a2a_events"
-      ) as mock_convert_artifact:
-        mock_artifact_event = Mock()
-        mock_convert_artifact.return_value = mock_artifact_event
+          "google.adk.a2a.converters.event_converter._create_status_update_event"
+      ) as mock_create_running:
+        mock_running_event = Mock()
+        mock_create_running.return_value = mock_running_event
 
-        with patch(
-            "google.adk.a2a.converters.event_converter._create_status_update_event"
-        ) as mock_create_running:
-          mock_running_event = Mock()
-          mock_create_running.return_value = mock_running_event
+        task_id = "custom-task-id"
+        context_id = "custom-context-id"
 
-          task_id = "custom-task-id"
-          context_id = "custom-context-id"
+        result = convert_event_to_a2a_events(
+            self.mock_event, self.mock_invocation_context, task_id, context_id
+        )
 
-          result = convert_event_to_a2a_events(
-              self.mock_event, self.mock_invocation_context, task_id, context_id
-          )
+        assert len(result) == 1  # 1 status
+        assert mock_running_event in result
 
-          assert len(result) == 2  # 1 artifact + 1 status
-          assert mock_artifact_event in result
-          assert mock_running_event in result
-
-          # Verify artifact conversion is called with custom IDs
-          mock_convert_artifact.assert_called_once_with(
-              self.mock_event,
-              self.mock_invocation_context,
-              "file1.txt",
-              1,
-              task_id,
-              context_id,
-          )
-
-          # Verify status update is called with custom IDs
-          mock_create_running.assert_called_once_with(
-              mock_message,
-              self.mock_invocation_context,
-              self.mock_event,
-              task_id,
-              context_id,
-          )
+        # Verify status update is called with custom IDs
+        mock_create_running.assert_called_once_with(
+            mock_message,
+            self.mock_invocation_context,
+            self.mock_event,
+            task_id,
+            context_id,
+        )
 
   def test_create_status_update_event_with_auth_required_state(self):
     """Test creation of status update event with auth_required state."""
@@ -822,8 +508,8 @@ class TestEventConverter:
         )
 
         assert isinstance(result, TaskStatusUpdateEvent)
-        assert result.taskId == task_id
-        assert result.contextId == context_id
+        assert result.task_id == task_id
+        assert result.context_id == context_id
         assert result.status.state == TaskState.auth_required
 
   def test_create_status_update_event_with_input_required_state(self):
@@ -886,8 +572,8 @@ class TestEventConverter:
         )
 
         assert isinstance(result, TaskStatusUpdateEvent)
-        assert result.taskId == task_id
-        assert result.contextId == context_id
+        assert result.task_id == task_id
+        assert result.context_id == context_id
         assert result.status.state == TaskState.input_required
 
 
@@ -897,39 +583,92 @@ class TestA2AToEventConverters:
   def setup_method(self):
     """Set up test fixtures."""
     self.mock_invocation_context = Mock(spec=InvocationContext)
-    self.mock_invocation_context.branch = "test-branch"
     self.mock_invocation_context.invocation_id = "test-invocation-id"
+    self.mock_invocation_context.branch = "test-branch"
 
-  def test_convert_a2a_task_to_event_with_status_message(self):
-    """Test converting A2A task with status message."""
-    from google.adk.a2a.converters.event_converter import convert_a2a_task_to_event
+  def test_convert_a2a_task_to_event_with_artifacts_priority(self):
+    """Test convert_a2a_task_to_event prioritizes artifacts over status/history."""
+    from a2a.types import Artifact
+    from a2a.types import Part
+    from a2a.types import TaskStatus
+    from a2a.types import TextPart
 
-    # Create mock message and task
-    mock_message = Mock(spec=Message)
-    mock_status = Mock()
-    mock_status.message = mock_message
+    # Create mock artifacts
+    artifact_part = Part(root=TextPart(text="artifact content"))
+    mock_artifact = Mock(spec=Artifact)
+    mock_artifact.parts = [artifact_part]
+
+    # Create mock status and history
+    status_part = Part(root=TextPart(text="status content"))
+    mock_status = Mock(spec=TaskStatus)
+    mock_status.message = Mock(spec=Message)
+    mock_status.message.parts = [status_part]
+
+    history_part = Part(root=TextPart(text="history content"))
+    mock_history_message = Mock(spec=Message)
+    mock_history_message.parts = [history_part]
+
+    # Create task with all three sources
     mock_task = Mock(spec=Task)
+    mock_task.artifacts = [mock_artifact]
     mock_task.status = mock_status
-    mock_task.history = []
+    mock_task.history = [mock_history_message]
 
-    # Mock the convert_a2a_message_to_event function
     with patch(
         "google.adk.a2a.converters.event_converter.convert_a2a_message_to_event"
     ) as mock_convert_message:
       mock_event = Mock(spec=Event)
-      mock_event.invocation_id = "test-invocation-id"
       mock_convert_message.return_value = mock_event
 
       result = convert_a2a_task_to_event(
           mock_task, "test-author", self.mock_invocation_context
       )
 
-      # Verify the message converter was called with correct parameters
-      mock_convert_message.assert_called_once_with(
-          mock_message, "test-author", self.mock_invocation_context
-      )
       assert result == mock_event
-      assert result.invocation_id == "test-invocation-id"
+      # Should call convert_a2a_message_to_event with a message created from artifacts
+      mock_convert_message.assert_called_once()
+      called_message = mock_convert_message.call_args[0][0]
+      assert called_message.role == Role.agent
+      assert called_message.parts == [artifact_part]
+
+  def test_convert_a2a_task_to_event_with_status_message(self):
+    """Test convert_a2a_task_to_event with status message (no artifacts)."""
+    from a2a.types import Part
+    from a2a.types import TaskStatus
+    from a2a.types import TextPart
+
+    # Create mock status
+    status_part = Part(root=TextPart(text="status content"))
+    mock_status = Mock(spec=TaskStatus)
+    mock_status.message = Mock(spec=Message)
+    mock_status.message.parts = [status_part]
+
+    # Create task with no artifacts
+    mock_task = Mock(spec=Task)
+    mock_task.artifacts = None
+    mock_task.status = mock_status
+    mock_task.history = []
+
+    with patch(
+        "google.adk.a2a.converters.event_converter.convert_a2a_message_to_event"
+    ) as mock_convert_message:
+      from google.adk.a2a.converters.part_converter import convert_a2a_part_to_genai_part
+
+      mock_event = Mock(spec=Event)
+      mock_convert_message.return_value = mock_event
+
+      result = convert_a2a_task_to_event(
+          mock_task, "test-author", self.mock_invocation_context
+      )
+
+      assert result == mock_event
+      # Should call convert_a2a_message_to_event with the status message
+      mock_convert_message.assert_called_once_with(
+          mock_status.message,
+          "test-author",
+          self.mock_invocation_context,
+          part_converter=convert_a2a_part_to_genai_part,
+      )
 
   def test_convert_a2a_task_to_event_with_history_message(self):
     """Test converting A2A task with history message when no status message."""
@@ -938,6 +677,7 @@ class TestA2AToEventConverters:
     # Create mock message and task
     mock_message = Mock(spec=Message)
     mock_task = Mock(spec=Task)
+    mock_task.artifacts = None
     mock_task.status = None
     mock_task.history = [mock_message]
 
@@ -945,6 +685,8 @@ class TestA2AToEventConverters:
     with patch(
         "google.adk.a2a.converters.event_converter.convert_a2a_message_to_event"
     ) as mock_convert_message:
+      from google.adk.a2a.converters.part_converter import convert_a2a_part_to_genai_part
+
       mock_event = Mock(spec=Event)
       mock_event.invocation_id = "test-invocation-id"
       mock_convert_message.return_value = mock_event
@@ -953,7 +695,10 @@ class TestA2AToEventConverters:
 
       # Verify the message converter was called with correct parameters
       mock_convert_message.assert_called_once_with(
-          mock_message, "test-author", None
+          mock_message,
+          "test-author",
+          None,
+          part_converter=convert_a2a_part_to_genai_part,
       )
       assert result == mock_event
 
@@ -963,6 +708,7 @@ class TestA2AToEventConverters:
 
     # Create mock task with no message
     mock_task = Mock(spec=Task)
+    mock_task.artifacts = None
     mock_task.status = None
     mock_task.history = []
 
@@ -982,6 +728,7 @@ class TestA2AToEventConverters:
 
     # Create mock task with no message
     mock_task = Mock(spec=Task)
+    mock_task.artifacts = None
     mock_task.status = None
     mock_task.history = []
 
@@ -1011,6 +758,7 @@ class TestA2AToEventConverters:
     mock_status = Mock()
     mock_status.message = mock_message
     mock_task = Mock(spec=Task)
+    mock_task.artifacts = None
     mock_task.status = mock_status
     mock_task.history = []
 
@@ -1023,10 +771,7 @@ class TestA2AToEventConverters:
       with pytest.raises(RuntimeError, match="Failed to convert task message"):
         convert_a2a_task_to_event(mock_task, "test-author")
 
-  @patch(
-      "google.adk.a2a.converters.event_converter.convert_a2a_part_to_genai_part"
-  )
-  def test_convert_a2a_message_to_event_success(self, mock_convert_part):
+  def test_convert_a2a_message_to_event_success(self):
     """Test successful conversion of A2A message to event."""
     from google.adk.a2a.converters.event_converter import convert_a2a_message_to_event
     from google.genai import types as genai_types
@@ -1034,13 +779,17 @@ class TestA2AToEventConverters:
     # Create mock parts and message with valid genai Part
     mock_a2a_part = Mock()
     mock_genai_part = genai_types.Part(text="test content")
+    mock_convert_part = Mock()
     mock_convert_part.return_value = mock_genai_part
 
     mock_message = Mock(spec=Message)
     mock_message.parts = [mock_a2a_part]
 
     result = convert_a2a_message_to_event(
-        mock_message, "test-author", self.mock_invocation_context
+        mock_message,
+        "test-author",
+        self.mock_invocation_context,
+        mock_convert_part,
     )
 
     # Verify conversion was successful
@@ -1052,12 +801,7 @@ class TestA2AToEventConverters:
     assert result.content.parts[0].text == "test content"
     mock_convert_part.assert_called_once_with(mock_a2a_part)
 
-  @patch(
-      "google.adk.a2a.converters.event_converter.convert_a2a_part_to_genai_part"
-  )
-  def test_convert_a2a_message_to_event_with_long_running_tools(
-      self, mock_convert_part
-  ):
+  def test_convert_a2a_message_to_event_with_long_running_tools(self):
     """Test conversion with long-running tools by mocking the entire flow."""
     from google.adk.a2a.converters.event_converter import convert_a2a_message_to_event
 
@@ -1067,6 +811,7 @@ class TestA2AToEventConverters:
     mock_message.parts = [mock_a2a_part]
 
     # Mock the part conversion to return None to simulate long-running tool detection logic
+    mock_convert_part = Mock()
     mock_convert_part.return_value = None
 
     # Patch the long-running tool detection since the main logic is in the actual conversion
@@ -1074,7 +819,10 @@ class TestA2AToEventConverters:
         "google.adk.a2a.converters.event_converter.logger"
     ) as mock_logger:
       result = convert_a2a_message_to_event(
-          mock_message, "test-author", self.mock_invocation_context
+          mock_message,
+          "test-author",
+          self.mock_invocation_context,
+          mock_convert_part,
       )
 
       # Verify basic conversion worked
@@ -1107,24 +855,23 @@ class TestA2AToEventConverters:
     with pytest.raises(ValueError, match="A2A message cannot be None"):
       convert_a2a_message_to_event(None)
 
-  @patch(
-      "google.adk.a2a.converters.event_converter.convert_a2a_part_to_genai_part"
-  )
-  def test_convert_a2a_message_to_event_part_conversion_fails(
-      self, mock_convert_part
-  ):
+  def test_convert_a2a_message_to_event_part_conversion_fails(self):
     """Test handling when part conversion returns None."""
     from google.adk.a2a.converters.event_converter import convert_a2a_message_to_event
 
     # Setup mock to return None (conversion failure)
     mock_a2a_part = Mock()
+    mock_convert_part = Mock()
     mock_convert_part.return_value = None
 
     mock_message = Mock(spec=Message)
     mock_message.parts = [mock_a2a_part]
 
     result = convert_a2a_message_to_event(
-        mock_message, "test-author", self.mock_invocation_context
+        mock_message,
+        "test-author",
+        self.mock_invocation_context,
+        mock_convert_part,
     )
 
     # Verify event was created but with no parts
@@ -1133,12 +880,7 @@ class TestA2AToEventConverters:
     assert result.content.role == "model"
     assert len(result.content.parts) == 0
 
-  @patch(
-      "google.adk.a2a.converters.event_converter.convert_a2a_part_to_genai_part"
-  )
-  def test_convert_a2a_message_to_event_part_conversion_exception(
-      self, mock_convert_part
-  ):
+  def test_convert_a2a_message_to_event_part_conversion_exception(self):
     """Test handling when part conversion raises exception."""
     from google.adk.a2a.converters.event_converter import convert_a2a_message_to_event
     from google.genai import types as genai_types
@@ -1148,6 +890,7 @@ class TestA2AToEventConverters:
     mock_a2a_part2 = Mock()
     mock_genai_part = genai_types.Part(text="successful conversion")
 
+    mock_convert_part = Mock()
     mock_convert_part.side_effect = [
         Exception("Conversion failed"),  # First part fails
         mock_genai_part,  # Second part succeeds
@@ -1157,7 +900,10 @@ class TestA2AToEventConverters:
     mock_message.parts = [mock_a2a_part1, mock_a2a_part2]
 
     result = convert_a2a_message_to_event(
-        mock_message, "test-author", self.mock_invocation_context
+        mock_message,
+        "test-author",
+        self.mock_invocation_context,
+        mock_convert_part,
     )
 
     # Verify event was created with only the successfully converted part
@@ -1167,12 +913,7 @@ class TestA2AToEventConverters:
     assert len(result.content.parts) == 1
     assert result.content.parts[0].text == "successful conversion"
 
-  @patch(
-      "google.adk.a2a.converters.event_converter.convert_a2a_part_to_genai_part"
-  )
-  def test_convert_a2a_message_to_event_missing_tool_id(
-      self, mock_convert_part
-  ):
+  def test_convert_a2a_message_to_event_missing_tool_id(self):
     """Test handling of message conversion when part conversion fails."""
     from google.adk.a2a.converters.event_converter import convert_a2a_message_to_event
 
@@ -1182,10 +923,14 @@ class TestA2AToEventConverters:
     mock_message.parts = [mock_a2a_part]
 
     # Mock the part conversion to return None
+    mock_convert_part = Mock()
     mock_convert_part.return_value = None
 
     result = convert_a2a_message_to_event(
-        mock_message, "test-author", self.mock_invocation_context
+        mock_message,
+        "test-author",
+        self.mock_invocation_context,
+        mock_convert_part,
     )
 
     # Verify basic conversion worked
